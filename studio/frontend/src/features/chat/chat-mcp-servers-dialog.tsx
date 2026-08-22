@@ -39,6 +39,7 @@ import {
   testMcpServer,
   updateMcpServer,
 } from "./api/mcp-servers-api";
+import { buildMcpOAuthFormPayload } from "./utils/mcp-oauth-form";
 type HeaderRow = { id: string; key: string; value: string };
 
 type FormState = {
@@ -46,6 +47,9 @@ type FormState = {
   url: string;
   headers: HeaderRow[];
   useOauth: boolean;
+  oauthClientId: string;
+  oauthClientSecret: string;
+  hasOauthClientSecret: boolean;
 };
 
 const EMPTY_FORM: FormState = {
@@ -53,6 +57,9 @@ const EMPTY_FORM: FormState = {
   url: "",
   headers: [],
   useOauth: false,
+  oauthClientId: "",
+  oauthClientSecret: "",
+  hasOauthClientSecret: false,
 };
 
 function newRowId(): string {
@@ -247,6 +254,9 @@ export function ChatMcpServersDialog({
       url: server.url,
       headers: headersFromObject(server.headers ?? {}),
       useOauth: server.use_oauth ?? false,
+      oauthClientId: server.oauth_client_id ?? "",
+      oauthClientSecret: "",
+      hasOauthClientSecret: server.has_oauth_client_secret ?? false,
     });
   }
 
@@ -264,9 +274,14 @@ export function ChatMcpServersDialog({
     setTesting(true);
     try {
       const result = await testMcpServer({
+        serverId: view.kind === "edit" ? view.id : undefined,
         url: trimmedUrl,
         headers: headersToObject(form.headers),
-        useOauth: form.useOauth,
+        ...buildMcpOAuthFormPayload(
+          form.useOauth,
+          form.oauthClientId,
+          form.oauthClientSecret,
+        ),
       });
       if (result.ok) {
         toast.success(
@@ -309,7 +324,11 @@ export function ChatMcpServersDialog({
           displayName: trimmedName,
           url: trimmedUrl,
           headers: headers ?? null,
-          useOauth: form.useOauth,
+          ...buildMcpOAuthFormPayload(
+            form.useOauth,
+            form.oauthClientId,
+            form.oauthClientSecret,
+          ),
         });
         toast.success("MCP server updated");
       } else {
@@ -317,7 +336,11 @@ export function ChatMcpServersDialog({
           displayName: trimmedName,
           url: trimmedUrl,
           headers: headers,
-          useOauth: form.useOauth,
+          ...buildMcpOAuthFormPayload(
+            form.useOauth,
+            form.oauthClientId,
+            form.oauthClientSecret,
+          ),
         });
         toast.success("MCP server added");
       }
@@ -518,6 +541,47 @@ export function ChatMcpServersDialog({
                     setForm((prev) => ({ ...prev, useOauth }))
                   }
                 />
+              </div>
+            )}
+
+            {!addressIsCommand && form.useOauth && (
+              <div className="grid gap-3 rounded-md border p-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="mcp-oauth-client-id">OAuth client ID</Label>
+                  <Input
+                    id="mcp-oauth-client-id"
+                    value={form.oauthClientId}
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        oauthClientId: e.target.value,
+                      }))
+                    }
+                    placeholder="Optional pre-registered client ID"
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="mcp-oauth-client-secret">
+                    OAuth client secret
+                  </Label>
+                  <Input
+                    id="mcp-oauth-client-secret"
+                    type="password"
+                    value={form.oauthClientSecret}
+                    onChange={(e) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        oauthClientSecret: e.target.value,
+                      }))
+                    }
+                    placeholder={
+                      form.hasOauthClientSecret
+                        ? "Leave blank to keep the stored secret"
+                        : "Optional client secret"
+                    }
+                    autoComplete="new-password"
+                  />
+                </div>
               </div>
             )}
 
