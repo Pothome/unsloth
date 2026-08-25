@@ -7,6 +7,7 @@ Like auth/storage.py (module-level functions, raw sqlite3, per-function
 connections) plus WAL mode and PRAGMA foreign_keys = ON for CASCADE deletes.
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -15,18 +16,22 @@ import platform
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 
 from utils.paths import (
     ensure_dir,
     project_workspaces_root,
     studio_db_path,
+    studio_root,
 )
 from utils.paths.external_media import is_linux_run_media_path, is_local_filesystem_root
 from utils.paths.scan_folder_health import is_readable_dir
@@ -99,10 +104,13 @@ def contains_sensitive_path_component(path: str) -> bool:
 
 
 _schema_lock = threading.Lock()
+_project_workspace_paths_lock = threading.RLock()
 _schema_ready = False
 _SQLITE_IN_CHUNK_SIZE = 900
 _PROJECT_WORKSPACE_SUBDIRS = ("sandbox",)
 _CHAT_ATTACHMENT_INVENTORY_VERSION = 1
+_DIRECTORY_IDENTITY_SCAN_ENTRY_LIMIT = 100_000
+_DIRECTORY_IDENTITY_SCAN_TIME_LIMIT_SECONDS = 1.0
 
 
 def _project_slug(name: str) -> str:
@@ -110,11 +118,54 @@ def _project_slug(name: str) -> str:
     return slug[:48] or "project"
 
 
+def _project_root_suffix(project_id: str) -> str:
+    suffix = re.sub(r"[^A-Za-z0-9_-]+", "-", project_id)[:8].strip("-_") or "project"
+    return suffix
+
+
 def _default_project_root(project: dict) -> str:
     project_id = str(project["id"])
-    suffix = re.sub(r"[^A-Za-z0-9_-]+", "-", project_id)[:8].strip("-_") or "project"
+    suffix = _project_root_suffix(project_id)
     folder_name = f"{_project_slug(str(project.get('name') or 'Project'))}-{suffix}"
     return str(project_workspaces_root() / folder_name)
+
+
+def _available_project_root(default_root: str, project_id: str) -> str:
+    conn = get_connection()
+    try:
+        claimed_paths = [
+            str(row["root_path"])
+            for row in conn.execute(
+                "SELECT root_path FROM chat_projects WHERE root_path IS NOT NULL"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    def path_key(path: str) -> str:
+        key = os.path.normcase(os.path.realpath(path))
+        return key.casefold() if platform.system() in {"Darwin", "Windows"} else key
+
+    claimed = {path_key(path) for path in claimed_paths}
+    default = Path(default_root)
+    suffix = _project_root_suffix(project_id)
+    prefix = default.name[: -(len(suffix) + 1)]
+    for index in range(1, 10_001):
+        candidate = default if index == 1 else default.with_name(f"{prefix}-{index}-{suffix}")
+        candidate_path = str(candidate)
+        if path_key(candidate_path) in claimed or candidate.exists():
+            continue
+        if any(
+            project_workspace_overlaps_managed_root(
+                candidate_path, claimed_path, check_descendants = True
+            )
+            for claimed_path in claimed_paths
+        ):
+            raise ProjectWorkspaceError(
+                candidate_path, PermissionError("managed project workspaces overlap")
+            )
+        return candidate_path
+    raise ProjectWorkspaceError(default_root, FileExistsError("no free project workspace path"))
 
 
 class ProjectWorkspaceError(OSError):
@@ -130,15 +181,296 @@ class ProjectWorkspaceError(OSError):
         self.path = path
 
 
-def _ensure_project_workspace(root_path: str) -> str:
+class ProjectWorkspaceUnavailableError(OSError):
+    def __init__(self, path: str, cause: BaseException):
+        super().__init__(f"Project workspace is unavailable: {path}")
+        self.path = path
+        self.cause = cause
+
+
+class ProjectWorkspaceConflictError(RuntimeError):
+    pass
+
+
+def _ensure_project_workspace(
+    root_path: str,
+    check_descendants: bool = False,
+    exclude_project_id: str | None = None,
+) -> str:
     root = Path(root_path).expanduser()
     try:
+        if _workspace_overlaps_live_project_path(
+            str(root), "workspace_path", check_descendants = check_descendants
+        ):
+            raise PermissionError("managed workspace overlaps an external project folder")
+        if _workspace_overlaps_live_project_path(
+            str(root),
+            "root_path",
+            check_descendants = check_descendants,
+            exclude_project_id = exclude_project_id,
+        ):
+            raise PermissionError("managed project workspaces overlap")
         root_resolved = ensure_dir(root).resolve()
         for subdir in _PROJECT_WORKSPACE_SUBDIRS:
             ensure_dir(root_resolved / subdir)
     except OSError as exc:
         raise ProjectWorkspaceError(str(root), exc) from exc
     return str(root_resolved)
+
+
+def _directory_tree_contains_identity(root: str, target: str) -> bool:
+    try:
+        target_stat = os.stat(target)
+    except OSError:
+        return True
+    target_identity = (target_stat.st_dev, target_stat.st_ino)
+    pending = [root]
+    visited = set()
+    scanned_entries = 0
+    deadline = time.monotonic() + _DIRECTORY_IDENTITY_SCAN_TIME_LIMIT_SECONDS
+    while pending:
+        if time.monotonic() >= deadline:
+            return True
+        current = pending.pop()
+        try:
+            current_stat = os.stat(current, follow_symlinks = False)
+            current_identity = (current_stat.st_dev, current_stat.st_ino)
+            if current_identity == target_identity:
+                return True
+            if current_identity in visited:
+                continue
+            visited.add(current_identity)
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    scanned_entries += 1
+                    if (
+                        scanned_entries > _DIRECTORY_IDENTITY_SCAN_ENTRY_LIMIT
+                        or time.monotonic() >= deadline
+                    ):
+                        return True
+                    if entry.is_dir(follow_symlinks = False):
+                        pending.append(entry.path)
+        except OSError:
+            return True
+    return False
+
+
+def _nearest_existing_directory(path: str) -> str | None:
+    candidate = Path(path)
+    while True:
+        if candidate.is_dir():
+            return str(candidate)
+        if candidate.parent == candidate:
+            return None
+        candidate = candidate.parent
+
+
+def _directory_uses_case_sensitive_names(path: str) -> bool | None:
+    probe_path = None
+    try:
+        descriptor, probe_path = tempfile.mkstemp(prefix = ".unsloth-case-probe-a-", dir = path)
+        os.close(descriptor)
+        probe = Path(probe_path)
+        return not os.path.samefile(probe, probe.with_name(probe.name.swapcase()))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return None
+    finally:
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+
+
+def _missing_paths_overlap_below_aliases(left: str, right: str) -> bool:
+    left_ancestor = _nearest_existing_directory(left)
+    right_ancestor = _nearest_existing_directory(right)
+    if not left_ancestor or not right_ancestor:
+        return False
+    try:
+        if not os.path.samefile(left_ancestor, right_ancestor):
+            return False
+        left_parts = Path(left).relative_to(left_ancestor).parts
+        right_parts = Path(right).relative_to(right_ancestor).parts
+    except (OSError, ValueError):
+        return False
+    if _directory_uses_case_sensitive_names(left_ancestor) is not True:
+        left_parts = tuple(part.casefold() for part in left_parts)
+        right_parts = tuple(part.casefold() for part in right_parts)
+    common_length = min(len(left_parts), len(right_parts))
+    return left_parts[:common_length] == right_parts[:common_length]
+
+
+def project_workspace_overlaps_managed_root(
+    workspace_path: str,
+    root_path: str,
+    check_descendants: bool = False,
+) -> bool:
+    try:
+        workspace = os.path.realpath(os.path.expanduser(workspace_path))
+        root = os.path.realpath(os.path.expanduser(root_path))
+        if os.path.commonpath([workspace, root]) in {workspace, root}:
+            return True
+        for candidate in (Path(workspace), *Path(workspace).parents):
+            try:
+                if os.path.samefile(candidate, root):
+                    return True
+            except OSError:
+                continue
+        for candidate in (Path(root), *Path(root).parents):
+            try:
+                if os.path.samefile(candidate, workspace):
+                    return True
+            except OSError:
+                continue
+        if check_descendants:
+            workspace_directory = workspace if os.path.isdir(workspace) else None
+            root_directory = root if os.path.isdir(root) else None
+            root_ancestor = _nearest_existing_directory(root)
+            workspace_ancestor = _nearest_existing_directory(workspace)
+            if _missing_paths_overlap_below_aliases(workspace, root):
+                return True
+            if (
+                workspace_directory
+                and root_ancestor
+                and _directory_tree_contains_identity(workspace_directory, root_ancestor)
+            ):
+                return True
+            if (
+                root_directory
+                and workspace_ancestor
+                and _directory_tree_contains_identity(root_directory, workspace_ancestor)
+            ):
+                return True
+        return False
+    except ValueError:
+        return False
+    except OSError:
+        return True
+
+
+def _workspace_overlaps_live_project_path(
+    workspace_path: str,
+    column: Literal["root_path", "workspace_path"],
+    check_descendants: bool = False,
+    exclude_project_id: str | None = None,
+) -> bool:
+    conn = get_connection()
+    try:
+        where = f"{column} IS NOT NULL"
+        params = []
+        if exclude_project_id is not None:
+            where += " AND id != ?"
+            params.append(exclude_project_id)
+        rows = conn.execute(
+            f"SELECT {column} AS path FROM chat_projects WHERE {where}",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return any(
+        project_workspace_overlaps_managed_root(
+            workspace_path,
+            str(row["path"]),
+            check_descendants = check_descendants,
+        )
+        for row in rows
+    )
+
+
+def _ensure_external_project_workspace(
+    workspace_path: str,
+    managed_root_path: Optional[str] = None,
+    check_descendants: bool = False,
+    exclude_project_id: str | None = None,
+    expected_identity: tuple[str, str] | None = None,
+) -> str:
+    workspace = Path(workspace_path).expanduser()
+    probe_path = None
+    try:
+        if workspace.is_symlink():
+            raise OSError("symlink workspaces are not supported")
+        resolved = workspace.resolve(strict = True)
+        if not resolved.is_dir():
+            raise NotADirectoryError(str(workspace))
+        if resolved.parent == resolved or resolved == Path.home().resolve():
+            raise PermissionError("unsafe workspace path")
+        if is_denied_system_path(str(resolved)):
+            raise PermissionError("unsafe workspace path")
+        if (
+            expected_identity is not None
+            and _directory_identity(str(resolved)) != expected_identity
+        ):
+            raise PermissionError("workspace identity changed")
+        if not os.access(resolved, os.R_OK | os.W_OK | os.X_OK):
+            raise PermissionError("workspace is not readable and writable")
+        with os.scandir(resolved) as entries:
+            next(entries, None)
+        descriptor, probe_path = tempfile.mkstemp(prefix = ".unsloth-workspace-probe-", dir = resolved)
+        os.close(descriptor)
+        os.unlink(probe_path)
+        probe_path = None
+        if managed_root_path and project_workspace_overlaps_managed_root(
+            str(resolved), managed_root_path, check_descendants = check_descendants
+        ):
+            raise PermissionError("workspace overlaps the managed project folder")
+        if _workspace_overlaps_live_project_path(
+            str(resolved), "root_path", check_descendants = check_descendants
+        ):
+            raise PermissionError("workspace overlaps a managed project folder")
+        if _workspace_overlaps_live_project_path(
+            str(resolved),
+            "workspace_path",
+            check_descendants = check_descendants,
+            exclude_project_id = exclude_project_id,
+        ):
+            raise PermissionError("workspace overlaps another external project folder")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProjectWorkspaceUnavailableError(str(workspace), exc) from exc
+    finally:
+        if probe_path:
+            try:
+                os.unlink(probe_path)
+            except OSError:
+                pass
+    return str(resolved)
+
+
+def _directory_identity(path: str) -> tuple[str, str]:
+    metadata = os.stat(path)
+    return f"{metadata.st_dev:x}", f"{metadata.st_ino:x}"
+
+
+def _project_workspace_identity(project: dict) -> tuple[str, str] | None:
+    device_id = project.get("workspaceDeviceId")
+    file_id = project.get("workspaceFileId")
+    if device_id is None or file_id is None:
+        return None
+    return str(device_id), str(file_id)
+
+
+def _external_project_workspace_available(
+    workspace_path: str,
+    managed_root_path: Optional[str] = None,
+    exclude_project_id: str | None = None,
+    expected_identity: tuple[str, str] | None = None,
+) -> bool:
+    try:
+        workspace = Path(workspace_path).expanduser()
+        if workspace.is_symlink():
+            return False
+        resolved = workspace.resolve(strict = True)
+        if not resolved.is_dir() or not os.access(resolved, os.R_OK | os.W_OK | os.X_OK):
+            return False
+        if expected_identity is None or _directory_identity(str(resolved)) != expected_identity:
+            return False
+        with os.scandir(resolved) as entries:
+            next(entries, None)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
 
 
 def sandbox_is_referenced_elsewhere(
@@ -179,6 +511,33 @@ def sandbox_is_referenced_elsewhere(
         conn.close()
 
 
+def record_orphaned_project_if_unowned(
+    project_id: str,
+    workspace: str,
+    pending_delete: bool = False,
+    root_path: str | None = None,
+    session_id: str | None = None,
+) -> bool:
+    with _project_workspace_paths_lock:
+        for path in (workspace, root_path):
+            if not path:
+                continue
+            if _workspace_overlaps_live_project_path(
+                path, "root_path", check_descendants = True
+            ) or _workspace_overlaps_live_project_path(
+                path, "workspace_path", check_descendants = True
+            ):
+                return False
+        from core.inference.tools import record_orphaned_project
+        return record_orphaned_project(
+            project_id,
+            workspace,
+            pending_delete,
+            root_path,
+            session_id,
+        )
+
+
 def _mentions_session(content_json: str, session_id: str) -> bool:
     """Whether this message's content names *session_id* as a sandbox."""
     try:
@@ -210,7 +569,26 @@ def delete_project_workspace(project: dict) -> None:
     in there first: pulling the working directory out from under a live
     subprocess is how a half-written file ends up outside any project.
     """
-    _delete_project_workspace(project)
+    if project.get("workspaceKind") == "external":
+        return
+    root_path = project.get("rootPath")
+    if not root_path:
+        return
+    with _project_workspace_paths_lock:
+        if _workspace_overlaps_live_project_path(
+            str(root_path), "workspace_path", check_descendants = True
+        ) or _workspace_overlaps_live_project_path(
+            str(root_path),
+            "root_path",
+            check_descendants = True,
+            exclude_project_id = str(project.get("id") or "") or None,
+        ):
+            logger.warning(
+                "Skipping project workspace delete because a live external workspace overlaps %s",
+                root_path,
+            )
+            return
+        _delete_project_workspace(project)
 
 
 def _delete_project_workspace(project: dict) -> None:
@@ -338,6 +716,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             instructions TEXT,
             root_path TEXT,
+            workspace_path TEXT,
+            workspace_session_id TEXT,
+            workspace_device_id TEXT,
+            workspace_file_id TEXT,
             archived INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
@@ -349,6 +731,35 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     }
     if "root_path" not in chat_project_cols:
         conn.execute("ALTER TABLE chat_projects ADD COLUMN root_path TEXT")
+    if "workspace_path" not in chat_project_cols:
+        conn.execute("ALTER TABLE chat_projects ADD COLUMN workspace_path TEXT")
+    if "workspace_session_id" not in chat_project_cols:
+        conn.execute("ALTER TABLE chat_projects ADD COLUMN workspace_session_id TEXT")
+    if "workspace_device_id" not in chat_project_cols:
+        conn.execute("ALTER TABLE chat_projects ADD COLUMN workspace_device_id TEXT")
+    if "workspace_file_id" not in chat_project_cols:
+        conn.execute("ALTER TABLE chat_projects ADD COLUMN workspace_file_id TEXT")
+    missing_workspace_sessions = conn.execute(
+        "SELECT id FROM chat_projects "
+        "WHERE workspace_session_id IS NULL OR workspace_session_id = ''"
+    ).fetchall()
+    for row in missing_workspace_sessions:
+        project_id = str(row["id"])
+        workspace_session_id = f"project-{project_id}"
+        if _project_default_session_orphan_exists(project_id):
+            workspace_session_id = _new_project_workspace_session_id(project_id)
+        conn.execute(
+            "UPDATE chat_projects SET workspace_session_id = ? WHERE id = ?",
+            (workspace_session_id, project_id),
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_workspace_session_id "
+        "ON chat_projects(workspace_session_id)"
+    )
+    conn.execute("CREATE TABLE IF NOT EXISTS chat_project_incarnations (id TEXT PRIMARY KEY)")
+    conn.execute(
+        "INSERT OR IGNORE INTO chat_project_incarnations (id) SELECT id FROM chat_projects"
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_chat_projects_archived_updated_at ON chat_projects(archived, updated_at)"
     )
@@ -1677,12 +2088,38 @@ def _chat_thread_from_row(row: sqlite3.Row, include_settings: bool = True) -> di
 def _chat_project_from_row(row: sqlite3.Row) -> dict:
     data = dict(row)
     root_path = data.get("root_path")
+    external_workspace_path = data.get("workspace_path")
+    workspace_path = external_workspace_path or (
+        os.path.join(root_path, "sandbox") if root_path else None
+    )
     return {
         "id": data["id"],
         "name": data["name"],
         "instructions": data.get("instructions") or "",
         "rootPath": root_path or None,
-        "sandboxPath": os.path.join(root_path, "sandbox") if root_path else None,
+        "workspacePath": workspace_path,
+        "workspaceSessionId": data.get("workspace_session_id") or f"project-{data['id']}",
+        "workspaceDeviceId": data.get("workspace_device_id"),
+        "workspaceFileId": data.get("workspace_file_id"),
+        "workspaceKind": "external" if external_workspace_path else "managed",
+        "workspaceAvailable": (
+            bool(workspace_path)
+            and _external_project_workspace_available(
+                workspace_path,
+                root_path,
+                exclude_project_id = str(data["id"]),
+                expected_identity = (
+                    str(data["workspace_device_id"]),
+                    str(data["workspace_file_id"]),
+                )
+                if data.get("workspace_device_id") is not None
+                and data.get("workspace_file_id") is not None
+                else None,
+            )
+        )
+        if external_workspace_path
+        else True,
+        "sandboxPath": workspace_path,
         "archived": bool(data["archived"]),
         "createdAt": data["created_at"],
         "updatedAt": data["updated_at"],
@@ -2370,23 +2807,201 @@ def count_chat_threads() -> int:
         conn.close()
 
 
-def upsert_chat_project(project: dict) -> dict:
+def _new_project_workspace_session_id(project_id: str) -> str:
+    encoded = base64.urlsafe_b64encode(project_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"project-workspace-{encoded}-{uuid.uuid4().hex}"
+
+
+def _project_default_session_orphan_exists(project_id: str) -> bool:
+    session_id = f"project-{project_id}"
+    storage_ids = (project_id, f"workspace\x1f{project_id}\x1f{session_id}")
+    for storage_id in storage_ids:
+        digest = hashlib.sha256(storage_id.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+        path = studio_root() / "orphaned-projects" / f"project-{digest}"
+        try:
+            with open(path, encoding = "utf-8") as fh:
+                record = json.loads(fh.read(4096).strip())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, TypeError):
+            return True
+        if (
+            isinstance(record, dict)
+            and record.get("id") == project_id
+            and not record.get("chat")
+            and record.get("sessionId") in (None, "", session_id)
+        ):
+            return True
+        return True
+    return False
+
+
+def _versioned_project_id_for_workspace_session(session_id: str) -> Optional[str]:
+    versioned_prefix = "project-workspace-"
+    if session_id.startswith(versioned_prefix):
+        encoded, separator, nonce = session_id[len(versioned_prefix) :].rpartition("-")
+        if separator and encoded and re.fullmatch(r"[0-9a-f]{32}", nonce):
+            try:
+                padding = "=" * (-len(encoded) % 4)
+                return base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return None
+    return None
+
+
+def project_id_for_workspace_session(session_id: str) -> Optional[str]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id FROM chat_projects WHERE workspace_session_id = ?",
+            (session_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is not None:
+        return str(row["id"])
+
+    versioned_project_id = _versioned_project_id_for_workspace_session(session_id)
+    if versioned_project_id is not None:
+        return versioned_project_id
+    if session_id.startswith("project-"):
+        return session_id[len("project-") :] or None
+    return None
+
+
+def project_workspace_incarnation_exists(project_id: str) -> bool:
+    conn = get_connection()
+    try:
+        return (
+            conn.execute(
+                "SELECT 1 FROM chat_project_incarnations WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            is not None
+        )
+    finally:
+        conn.close()
+
+
+def upsert_chat_project(
+    project: dict,
+    external_workspace_path: Optional[str] = None,
+    external_workspace_identity: tuple[str, str] | None = None,
+) -> dict:
+    with _project_workspace_paths_lock:
+        if external_workspace_path:
+            from core.inference.tools import adopt_orphaned_workspace_when_idle
+
+            changed, result = adopt_orphaned_workspace_when_idle(
+                external_workspace_path,
+                lambda: _upsert_chat_project(
+                    project,
+                    external_workspace_path,
+                    external_workspace_identity,
+                ),
+            )
+            if not changed:
+                raise ProjectWorkspaceConflictError(
+                    "Wait for active tool calls in the selected folder to finish"
+                )
+            return result
+        return _upsert_chat_project(
+            project,
+            external_workspace_path,
+            external_workspace_identity,
+        )
+
+
+def _upsert_chat_project(
+    project: dict,
+    external_workspace_path: Optional[str] = None,
+    external_workspace_identity: tuple[str, str] | None = None,
+) -> dict:
     existing = get_chat_project(project["id"])
+    if existing and external_workspace_path:
+        raise ProjectWorkspaceConflictError(
+            "Use the project update endpoint to change its working directory"
+        )
     root_path = existing.get("rootPath") if existing else None
     if not root_path:
         root_path = _default_project_root(project)
-    root_path = _ensure_project_workspace(root_path)
+        if not existing:
+            root_path = _available_project_root(root_path, str(project["id"]))
+    workspace_path = (
+        existing.get("workspacePath")
+        if existing and existing.get("workspaceKind") == "external"
+        else None
+    )
+    if workspace_path:
+        workspace_identity = _project_workspace_identity(existing)
+        if workspace_identity is None:
+            raise ProjectWorkspaceUnavailableError(
+                workspace_path,
+                PermissionError("workspace identity is unavailable"),
+            )
+        workspace_path = _ensure_external_project_workspace(
+            workspace_path,
+            root_path,
+            exclude_project_id = str(project["id"]),
+            expected_identity = workspace_identity,
+        )
+        workspace_identity = workspace_identity or _directory_identity(workspace_path)
+    elif external_workspace_path and not existing:
+        workspace_path = _ensure_external_project_workspace(
+            external_workspace_path,
+            root_path,
+            check_descendants = True,
+            exclude_project_id = str(project["id"]),
+            expected_identity = external_workspace_identity,
+        )
+        workspace_identity = external_workspace_identity or _directory_identity(workspace_path)
+    else:
+        workspace_identity = None
+        root_path = _ensure_project_workspace(
+            root_path,
+            check_descendants = not os.path.isdir(root_path),
+            exclude_project_id = str(project["id"]) if existing else None,
+        )
     conn = get_connection()
     try:
+        workspace_session_id = existing.get("workspaceSessionId") if existing else None
+        if workspace_session_id is None:
+            first_incarnation = (
+                conn.execute(
+                    "INSERT OR IGNORE INTO chat_project_incarnations (id) VALUES (?)",
+                    (project["id"],),
+                ).rowcount
+                == 1
+            )
+            default_session_id = f"project-{project['id']}"
+            if first_incarnation and (
+                _versioned_project_id_for_workspace_session(default_session_id) is not None
+                or _project_default_session_orphan_exists(str(project["id"]))
+            ):
+                first_incarnation = False
+            workspace_session_id = (
+                default_session_id
+                if first_incarnation
+                else _new_project_workspace_session_id(project["id"])
+            )
         conn.execute(
             """
             INSERT INTO chat_projects
-                (id, name, instructions, root_path, archived, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, name, instructions, root_path, workspace_path, workspace_session_id,
+                 workspace_device_id, workspace_file_id, archived, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 instructions = excluded.instructions,
                 root_path = COALESCE(chat_projects.root_path, excluded.root_path),
+                workspace_path = chat_projects.workspace_path,
+                workspace_session_id = chat_projects.workspace_session_id,
+                workspace_device_id = COALESCE(
+                    chat_projects.workspace_device_id, excluded.workspace_device_id
+                ),
+                workspace_file_id = COALESCE(
+                    chat_projects.workspace_file_id, excluded.workspace_file_id
+                ),
                 archived = excluded.archived,
                 created_at = excluded.created_at,
                 updated_at = excluded.updated_at
@@ -2396,6 +3011,10 @@ def upsert_chat_project(project: dict) -> dict:
                 project["name"],
                 project.get("instructions") or "",
                 root_path,
+                workspace_path,
+                workspace_session_id,
+                workspace_identity[0] if workspace_identity else None,
+                workspace_identity[1] if workspace_identity else None,
                 1 if project.get("archived") else 0,
                 int(project["createdAt"]),
                 int(project["updatedAt"]),
@@ -2437,12 +3056,125 @@ def update_chat_project(id: str, patch: dict) -> Optional[dict]:
         conn.close()
 
 
-def ensure_chat_project_workspace(id: str) -> Optional[dict]:
+def set_chat_project_workspace(
+    id: str,
+    external_workspace_path: Optional[str],
+    external_workspace_identity: tuple[str, str] | None = None,
+) -> Optional[dict]:
+    with _project_workspace_paths_lock:
+        if external_workspace_path:
+            if get_chat_project(id) is None:
+                return None
+            from core.inference.tools import adopt_orphaned_workspace_when_idle
+
+            changed, result = adopt_orphaned_workspace_when_idle(
+                external_workspace_path,
+                lambda: _set_chat_project_workspace(
+                    id,
+                    external_workspace_path,
+                    external_workspace_identity,
+                ),
+            )
+            if not changed:
+                raise ProjectWorkspaceConflictError(
+                    "Wait for active tool calls in the selected folder to finish"
+                )
+            return result
+        return _set_chat_project_workspace(
+            id,
+            external_workspace_path,
+            external_workspace_identity,
+        )
+
+
+def _set_chat_project_workspace(
+    id: str,
+    external_workspace_path: Optional[str],
+    external_workspace_identity: tuple[str, str] | None = None,
+) -> Optional[dict]:
     project = get_chat_project(id)
     if project is None:
         return None
     root_path = project.get("rootPath") or _default_project_root(project)
-    root_path = _ensure_project_workspace(root_path)
+    if external_workspace_path is None:
+        root_path = _ensure_project_workspace(
+            root_path, check_descendants = True, exclude_project_id = id
+        )
+        workspace_path = None
+        workspace_identity = None
+        if project.get("workspaceKind") == "managed" and project.get("rootPath") == root_path:
+            return project
+    else:
+        workspace_path = _ensure_external_project_workspace(
+            external_workspace_path,
+            root_path,
+            check_descendants = True,
+            exclude_project_id = id,
+            expected_identity = external_workspace_identity,
+        )
+        workspace_identity = external_workspace_identity or _directory_identity(workspace_path)
+        if (
+            project.get("workspaceKind") == "external"
+            and project.get("workspacePath") == workspace_path
+            and _project_workspace_identity(project) == workspace_identity
+        ):
+            return project
+    workspace_session_id = _new_project_workspace_session_id(id)
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE chat_projects SET root_path = ?, workspace_path = ?, "
+            "workspace_session_id = ?, workspace_device_id = ?, workspace_file_id = ? WHERE id = ?",
+            (
+                root_path,
+                workspace_path,
+                workspace_session_id,
+                workspace_identity[0] if workspace_identity else None,
+                workspace_identity[1] if workspace_identity else None,
+                id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_chat_project(id)
+
+
+def ensure_chat_project_workspace(id: str) -> Optional[dict]:
+    project = get_chat_project(id)
+    if project is None:
+        return None
+    if project.get("workspaceKind") == "external":
+        workspace_identity = _project_workspace_identity(project)
+        if workspace_identity is None:
+            raise ProjectWorkspaceUnavailableError(
+                str(project.get("workspacePath") or ""),
+                PermissionError("workspace identity is unavailable"),
+            )
+        workspace_path = _ensure_external_project_workspace(
+            str(project.get("workspacePath") or ""),
+            str(project.get("rootPath") or "") or None,
+            exclude_project_id = id,
+            expected_identity = workspace_identity,
+        )
+        if project.get("workspacePath") == workspace_path:
+            return project
+        conn = get_connection()
+        try:
+            conn.execute(
+                "UPDATE chat_projects SET workspace_path = ? WHERE id = ?",
+                (workspace_path, id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return get_chat_project(id)
+    root_path = project.get("rootPath") or _default_project_root(project)
+    root_path = _ensure_project_workspace(
+        root_path,
+        check_descendants = not os.path.isdir(root_path),
+        exclude_project_id = id,
+    )
     # a delete running in another threadpool worker can drop the row at any point before the
     # directory is created, so confirm the project outlived the create rather than trusting a
     # pre-create snapshot. Removing the directory here is not this function's call: only the
@@ -2487,7 +3219,14 @@ def list_chat_projects(include_archived: bool = False) -> list[dict]:
 
 
 def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
+    with _project_workspace_paths_lock:
+        return _delete_chat_project(id, delete_files)
+
+
+def _delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
+    reservation = None
+    committed = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_chat_attachment_inventory_current(conn)
@@ -2496,6 +3235,23 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
             conn.rollback()
             return None
         project = _chat_project_from_row(row)
+        workspace = project.get("workspacePath")
+        if workspace:
+            from core.inference.tools import record_orphaned_project
+
+            session_id = project.get("workspaceSessionId") or f"project-{id}"
+            root_path = (
+                project.get("rootPath") if project.get("workspaceKind") == "managed" else None
+            )
+            if not record_orphaned_project(
+                id,
+                workspace,
+                False,
+                root_path,
+                session_id,
+            ):
+                raise OSError(f"Could not reserve project workspace {workspace}")
+            reservation = (session_id, workspace, root_path)
         thread_ids = {
             thread["id"]
             for thread in conn.execute(
@@ -2530,8 +3286,18 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         conn.execute("DELETE FROM chat_projects WHERE id = ?", (id,))
         _mark_chat_attachment_inventory_clean(conn)
         conn.commit()
+        committed = True
         if delete_files:
-            _delete_project_workspace(project)
+            delete_project_workspace(project)
+            if reservation:
+                from core.inference.tools import forget_orphaned_project_if_gone
+                forget_orphaned_project_if_gone(
+                    id,
+                    reservation[1],
+                    reservation[2],
+                    False,
+                    reservation[0],
+                )
         # The membership this transaction actually deleted, which is not the
         # caller's earlier listing when a chat was moved in between the two.
         project = dict(project)
@@ -2540,6 +3306,9 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         return project
     except Exception:
         conn.rollback()
+        if reservation and not committed:
+            from core.inference.tools import forget_orphaned_project_session
+            forget_orphaned_project_session(id, reservation[0])
         raise
     finally:
         conn.close()
