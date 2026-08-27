@@ -16153,9 +16153,50 @@ def _decode_audio_base64(b64: str) -> "np.ndarray":
         tmp.write(raw)
         tmp_path = tmp.name
     try:
-        waveform, sr = torchaudio.load(tmp_path)
+        # A small compressed file (amr/wma/opus) can hold hours of PCM, so bound
+        # the decode the same way the GGUF path does rather than materializing it
+        # and checking after.
+        try:
+            probe = torchaudio.info(tmp_path)
+            rate = int(getattr(probe, "sample_rate", 0) or 0)
+            frames = int(getattr(probe, "num_frames", 0) or 0)
+            channels = max(1, int(getattr(probe, "num_channels", 1) or 1))
+        except Exception:  # noqa: BLE001 - a container info cannot read is still loadable
+            rate, frames, channels = 0, 0, 1
+        limit = rate * _MAX_AUDIO_SECONDS
+        if limit and frames > limit:
+            raise _DecodedAudioTooLongError(
+                f"decoded audio exceeds the {_MAX_AUDIO_SECONDS // 60}-minute limit"
+            )
+        # load() materializes every channel at the native rate, so it is only safe
+        # when info said how long the file is and that fits the ceiling. Anything
+        # else -- an unreadable probe, an unreported length, a high rate or a
+        # multichannel file -- goes to the bounded reader, which downmixes as it
+        # goes and holds mono frames only. Streaming beats refusing: the file is
+        # inside the clock, it is just too wide to hold at once.
+        if limit and frames and frames * channels <= _MAX_DECODED_SAMPLES:
+            # One frame past the cap, so a container that misreports its length
+            # is still never fully read. Both caps apply: info() is the value
+            # being distrusted here, so an understated num_frames must not let
+            # the read run to the rate-relative limit, which at 192 kHz is four
+            # times the sample ceiling. A file that fits is unaffected: its
+            # length is under both.
+            read_frames = min(limit, _MAX_DECODED_SAMPLES // channels)
+            waveform, sr = torchaudio.load(tmp_path, num_frames = read_frames + 1)
+        else:
+            import torch
+            samples, sr = _decode_audio_mono(raw)
+            waveform = torch.from_numpy(samples).unsqueeze(0)
     finally:
         os.unlink(tmp_path)
+
+    # Backstop for a container that reported neither rate nor length.
+    if (sr > 0 and waveform.shape[-1] > sr * _MAX_AUDIO_SECONDS) or (
+        waveform.shape[-1] * waveform.shape[0] > _MAX_DECODED_SAMPLES
+    ):
+        raise _DecodedAudioTooLongError(
+            f"decoded audio exceeds the {_MAX_AUDIO_SECONDS // 60}-minute limit"
+        )
 
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim = 0, keepdim = True)
@@ -16177,8 +16218,17 @@ _MAX_AUDIO_B64_CHARS = STT_AUDIO_B64_MAX_CHARS
 # Flooring instead refused a file of exactly the size the composer allows.
 _MAX_VIDEO_B64_CHARS = 4 * math.ceil((64 * 1024 * 1024) / 3)
 _MAX_AUDIO_SECONDS = 30 * 60
+# The duration cap alone is rate-relative, so a high-rate container retains far
+# more memory for the same 30 minutes: at 48 kHz that is 86M float32 samples,
+# and np.concatenate doubles it. 48 kHz covers ordinary uploads, so this ceiling
+# only refuses rates above it, and never before the duration cap bites.
+_MAX_DECODED_SAMPLES = 48_000 * _MAX_AUDIO_SECONDS
 _WAV_HEADER_BYTES = 44
 _MIN_TRANSCODE_AUDIO_SAMPLE_RATE = 8000
+
+
+class _DecodedAudioTooLongError(ValueError):
+    """Decoded audio crossed the duration cap before it could be buffered."""
 
 
 def _sniff_audio_container(raw: bytes) -> Optional[str]:
@@ -16186,10 +16236,33 @@ def _sniff_audio_container(raw: bytes) -> Optional[str]:
     directly (so we can forward them untouched), else None (needs transcoding)."""
     if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE":
         return "wav"
-    # mp3: ID3 tag, or an MPEG audio frame sync (no other accepted format leads
-    # with 0xFF, so the simple sync check doesn't collide).
-    if raw[:3] == b"ID3" or (len(raw) >= 2 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0):
-        return "mp3"
+
+    # An ID3v2 tag can prefix any MPEG audio layer (and occasionally AAC), so
+    # skip it before deciding whether the first frame is actually Layer III.
+    # The four size bytes are synchsafe: their top bit must be clear.
+    frame_offset = 0
+    if len(raw) >= 10 and raw[:3] == b"ID3" and not any(byte & 0x80 for byte in raw[6:10]):
+        tag_size = 0
+        for byte in raw[6:10]:
+            tag_size = (tag_size << 7) | byte
+        frame_offset = 10 + tag_size
+        # ID3v2.4's optional footer is not included in the stored tag size.
+        if raw[3] == 4 and raw[5] & 0x10:
+            frame_offset += 10
+
+    # MPEG audio frame header: the 11-bit sync is followed by version and layer
+    # bits. Layer III is binary 01; Layer II (MP2) is 10, while ADTS AAC uses
+    # the reserved MPEG layer value 00. Only Layer III is safe to pass as mp3.
+    if len(raw) >= frame_offset + 2:
+        first, second = raw[frame_offset : frame_offset + 2]
+        version = (second >> 3) & 0x03
+        layer = (second >> 1) & 0x03
+        is_mpeg_sync = first == 0xFF and (second & 0xE0) == 0xE0
+        if is_mpeg_sync and version != 0x01 and layer == 0x01:
+            return "mp3"
+
+    # ID3-only or malformed MPEG data must go through the decoder too; treating
+    # the tag itself as proof of MP3 would reintroduce the MP2/AAC collision.
     return None
 
 
@@ -16257,47 +16330,148 @@ def _fit_transcoded_audio_to_wav_cap(
     return fitted, target_rate
 
 
+def _decode_audio_mono_with_soundfile(raw: bytes) -> "tuple[np.ndarray, int]":
+    """Decode libsndfile-supported audio in bounded blocks."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+
+    chunks = []
+    sample_count = 0
+    with sf.SoundFile(io.BytesIO(raw)) as source:
+        sample_rate = int(source.samplerate)
+        if sample_rate <= 0:
+            raise ValueError("decoded audio has an invalid sample rate")
+        block_frames = max(1, min(sample_rate, 65_536))
+        for block in source.blocks(
+            blocksize = block_frames,
+            dtype = "float32",
+            always_2d = False,
+        ):
+            sample_count += len(block)
+            if (
+                sample_count > sample_rate * _MAX_AUDIO_SECONDS
+                or sample_count > _MAX_DECODED_SAMPLES
+            ):
+                raise _DecodedAudioTooLongError(
+                    f"decoded audio exceeds the {_MAX_AUDIO_SECONDS // 60}-minute limit"
+                )
+            if block.ndim > 1:
+                block = block.mean(axis = 1)
+            chunks.append(block)
+    if not chunks:
+        raise ValueError("audio container decoded to no samples")
+    return np.concatenate(chunks, axis = 0).astype(np.float32, copy = False), sample_rate
+
+
+def _decode_audio_mono_with_av(raw: bytes) -> "tuple[np.ndarray, int]":
+    """Decode an audio container with PyAV's bundled FFmpeg libraries."""
+    import io
+
+    import av
+    import numpy as np
+
+    chunks = []
+    sample_rate = 0
+    sample_count = 0
+    resampler = None
+
+    def append_resampled(resampled) -> None:
+        nonlocal sample_count
+        sample_count += int(resampled.samples)
+        if sample_count > sample_rate * _MAX_AUDIO_SECONDS or sample_count > _MAX_DECODED_SAMPLES:
+            raise _DecodedAudioTooLongError(
+                f"decoded audio exceeds the {_MAX_AUDIO_SECONDS // 60}-minute limit"
+            )
+        chunks.append(resampled.to_ndarray().reshape(-1))
+
+    with av.open(io.BytesIO(raw), mode = "r", metadata_errors = "ignore") as container:
+        if not container.streams.audio:
+            raise ValueError("audio container has no audio stream")
+        for frame in container.decode(audio = 0):
+            if resampler is None:
+                sample_rate = int(frame.sample_rate or 0)
+                if sample_rate <= 0:
+                    raise ValueError("decoded audio has an invalid sample rate")
+                resampler = av.AudioResampler(
+                    format = "flt",
+                    layout = "mono",
+                    rate = sample_rate,
+                )
+            for resampled in resampler.resample(frame):
+                append_resampled(resampled)
+        if resampler is not None:
+            for resampled in resampler.resample(None):
+                append_resampled(resampled)
+    if not chunks:
+        raise ValueError("audio container decoded to no samples")
+    return np.concatenate(chunks).astype(np.float32, copy = False), sample_rate
+
+
 def _decode_audio_mono(raw: bytes) -> "tuple[np.ndarray, int]":
     """Decode audio bytes to (mono float32 array, native sample_rate).
 
-    soundfile (libsndfile) reads wav/mp3/ogg/flac straight from memory. librosa
-    (ffmpeg-backed) additionally covers m4a/webm but needs a real path and is
-    absent on no-torch GGUF-only installs. Both imports are inside the fallback
-    so a missing decoder degrades to the next one (and finally a clear error)
-    rather than crashing.
+    soundfile (libsndfile) reads wav/mp3/ogg/flac in bounded blocks. PyAV is
+    installed in every Studio environment and uses its bundled FFmpeg libraries
+    for containers including m4a/webm/WMA/AMR. librosa remains the final fallback
+    in full ML environments, but is absent from no-torch GGUF-only installs.
     """
-    import io
-
     try:
-        import soundfile as sf
-        arr, sr = sf.read(io.BytesIO(raw), dtype = "float32")
+        arr, sr = _decode_audio_mono_with_soundfile(raw)
+    except _DecodedAudioTooLongError:
+        raise
     except Exception:
         try:
-            import librosa
-        except ModuleNotFoundError as e:
-            raise RuntimeError(
-                "this audio format needs librosa, which is not installed in "
-                "GGUF-only environments; use wav, mp3, ogg or flac"
-            ) from e
-        import os
-        import tempfile
-        from utils.paths import ensure_dir, tmp_root
+            arr, sr = _decode_audio_mono_with_av(raw)
+        except _DecodedAudioTooLongError:
+            raise
+        except Exception as av_error:
+            try:
+                import librosa
+            except ModuleNotFoundError:
+                raise RuntimeError(
+                    "this audio format could not be decoded; run `unsloth studio update` "
+                    "to install PyAV or convert it to wav, mp3, ogg or flac"
+                ) from av_error
+            import os
+            import tempfile
+            from utils.paths import ensure_dir, tmp_root
 
-        with tempfile.NamedTemporaryFile(
-            suffix = ".audio",
-            delete = False,
-            dir = str(ensure_dir(tmp_root())),
-        ) as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        try:
-            arr, sr = librosa.load(tmp_path, sr = None, mono = True)
-        finally:
-            os.unlink(tmp_path)
+            with tempfile.NamedTemporaryFile(
+                suffix = ".audio",
+                delete = False,
+                dir = str(ensure_dir(tmp_root())),
+            ) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+            try:
+                # audioread/FFmpeg would otherwise materialize the whole
+                # waveform before the check below. Ask for the native rate first
+                # so the window covers the sample ceiling as well as the clock.
+                try:
+                    probe_rate = int(librosa.get_samplerate(tmp_path) or 0)
+                except Exception:  # noqa: BLE001 - handled below
+                    probe_rate = 0
+                if probe_rate <= 0:
+                    # Without the rate there is no window that bounds the read:
+                    # 30 minutes is gigabytes at a high rate and nothing at a low
+                    # one. This is the last fallback, after soundfile and PyAV
+                    # both declined, so refusing costs a file nothing else reads.
+                    raise RuntimeError(
+                        "this audio file does not report a sample rate, so it cannot "
+                        "be decoded within the size limit; convert it to wav or mp3"
+                    )
+                window = min(float(_MAX_AUDIO_SECONDS + 1), _MAX_DECODED_SAMPLES / probe_rate + 1)
+                arr, sr = librosa.load(tmp_path, sr = None, mono = True, duration = window)
+            finally:
+                os.unlink(tmp_path)
     if arr.ndim > 1:
         arr = arr.mean(axis = 1)
-    if sr > 0 and len(arr) > sr * _MAX_AUDIO_SECONDS:
-        raise ValueError(f"decoded audio exceeds the {_MAX_AUDIO_SECONDS // 60}-minute limit")
+    if (sr > 0 and len(arr) > sr * _MAX_AUDIO_SECONDS) or len(arr) > _MAX_DECODED_SAMPLES:
+        raise _DecodedAudioTooLongError(
+            f"decoded audio exceeds the {_MAX_AUDIO_SECONDS // 60}-minute limit"
+        )
     return arr, sr
 
 
@@ -18469,6 +18643,13 @@ async def produce_openai_chat_completions(
             try:
                 audio_array = _decode_audio_base64(payload.audio_base64)
                 system_prompt, chat_messages, _ = _extract_content_parts(payload.messages)
+            except _DecodedAudioTooLongError as e:
+                # A limit the caller can act on, not a server fault.
+                api_monitor.fail(monitor_id, str(e))
+                raise HTTPException(
+                    status_code = 413,
+                    detail = f"Audio is too long (max {_MAX_AUDIO_SECONDS // 60} minutes).",
+                )
             except Exception as e:
                 api_monitor.fail(monitor_id, _friendly_error(e))
                 raise
@@ -18909,6 +19090,11 @@ async def produce_openai_chat_completions(
                 audio_b64, audio_format = await asyncio.to_thread(
                     _prepare_audio_for_llama, payload.audio_base64
                 )
+            except _DecodedAudioTooLongError as e:
+                # A valid file that is simply too long reports the limit, as the
+                # non-GGUF path does, rather than reading as corrupt audio.
+                logger.info("Audio rejected at the duration limit: %s", e)
+                raise _reject(413, f"Audio is too long (max {_MAX_AUDIO_SECONDS // 60} minutes).")
             except Exception as e:
                 logger.warning("Audio decode failed: %s", e, exc_info = True)
                 raise _reject(400, "Could not decode the provided audio file.")
