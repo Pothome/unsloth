@@ -4680,6 +4680,13 @@ class DiffusionBackend:
                                 effective_policy != OFFLOAD_NONE,
                                 "legacy flag" if cpu_offload else "from the memory plan",
                             ),
+                            "family_override": (
+                                family_override,
+                                fam.name,
+                                "explicit family override applied"
+                                if family_override
+                                else "auto-detected from repository name and metadata",
+                            ),
                         }
                     )
 
