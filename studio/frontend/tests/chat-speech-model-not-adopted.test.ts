@@ -95,10 +95,13 @@ test("the mount-time status sync treats a speech model as an empty slot", () => 
     /const chatActiveModel =\s*\n?\s*statusRes\.active_model && !isSpeechOnlyStatus\(statusRes\);/,
   );
   // Both edges, or the eviction branch would stop clearing a stale pick.
-  assert.match(hook, /if \(chatActiveModel && !isExternalSelectionActive\)/);
   assert.match(
     hook,
-    /\} else if \(!chatActiveModel && !isExternalSelectionActive\)/,
+    /if \(\s*chatActiveModel &&\s*!isExternalSelectionActive &&\s*!selectionChanged\s*\)/,
+  );
+  assert.match(
+    hook,
+    /\} else if \(\s*!chatActiveModel &&\s*!isExternalSelectionActive &&\s*!selectionChanged\s*\)/,
   );
   assert.match(
     hook,

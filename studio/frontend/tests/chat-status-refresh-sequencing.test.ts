@@ -61,3 +61,25 @@ test("the eviction branch is behind the same guard", () => {
   const guardAt = SYNC.indexOf("superseded()");
   assert.ok(guardAt !== -1 && guardAt < evictionAt);
 });
+
+test("refresh leaves residency untouched while a load is in flight", () => {
+  assert.match(
+    SYNC,
+    /if \(\(statusRes\.loading\?\.length \?\? 0\) > 0\) return;/,
+  );
+});
+
+test("the mount observer adopts only a settled model", () => {
+  const wait = SOURCE.slice(
+    SOURCE.indexOf("async function waitForServerModel("),
+    SOURCE.indexOf("function parseTrailingEpoch("),
+  );
+  assert.match(
+    wait,
+    /if \(!loading && status\.active_model\) \{\s*await tryAdoptServerActiveModel\(\{ status \}\);/,
+  );
+  assert.match(
+    wait,
+    /!useChatRuntimeStore\.getState\(\)\.params\.checkpoint &&\s*!useChatRuntimeStore\.getState\(\)\.modelLoading/,
+  );
+});
