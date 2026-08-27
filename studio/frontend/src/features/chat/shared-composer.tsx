@@ -2209,6 +2209,7 @@ export function SharedComposer({
       )}
       <textarea
         ref={textareaRef}
+        data-type-to-activate="composer"
         value={text}
         onChange={(e) => {
           // ALWAYS mirror the DOM value into React state, even during IME
