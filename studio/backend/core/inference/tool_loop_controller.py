@@ -503,7 +503,11 @@ class ToolLoopController:
             heal = self._auto_heal_tool_calls,
             tool_name = tool_name,
         )
-        key = canonical_tool_call_key(tool_name, coerced.arguments)
+        arguments = coerced.arguments
+        if tool_name == "web_search":
+            from core.inference.tools import canonicalize_web_search_arguments
+            arguments = canonicalize_web_search_arguments(arguments)
+        key = canonical_tool_call_key(tool_name, arguments)
         mcp = mcp_display_parts(tool_name)
         provenance = tool_event_provenance(
             healed = coerced.healed,
@@ -529,11 +533,11 @@ class ToolLoopController:
         return ToolCallDecision(
             action = action,
             tool_name = tool_name,
-            arguments = coerced.arguments,
+            arguments = arguments,
             tool_call_id = str(tool_call.get("id") or ""),
             key = key,
             provenance = provenance,
-            status_text = status_for_tool(tool_name, coerced.arguments),
+            status_text = status_for_tool(tool_name, arguments),
             noop_result = noop,
         )
 
