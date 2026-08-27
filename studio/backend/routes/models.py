@@ -1209,19 +1209,19 @@ async def _shared_compat_local_inventory_scan(
     requested_sources = sources
 
     def classify(models: List[LocalModelInfo]) -> List[LocalModelInfo]:
-        # Tag each model with its task so the Images picker can filter to diffusion.
+        # Tag each model with its task and native-audio type for the model pickers.
         # Inside the shared flight so overlapping callers reuse one classified result
         # instead of each repeating the GGUF header reads.
         classified = []
         for model in models:
-            task = _local_model_task(model)
+            task, audio_type = _catalog_classification._local_model_classification_for_task(
+                model, _local_model_task(model)
+            )
             classified.append(
                 model.model_copy(
                     update = {
                         "task": task,
-                        "audio_type": _catalog_classification._local_model_audio_type(model)
-                        if task == "text-to-speech"
-                        else None,
+                        "audio_type": audio_type,
                     }
                 )
             )
@@ -2516,7 +2516,11 @@ async def scan_model_remote_code(
         except Exception:
             _primary_preexisting = True
         requested_scan_target = scan_target
-        requested_security_targets = [requested_scan_target]
+        from core.inference.native_audio import native_audio_security_targets
+
+        requested_security_targets = native_audio_security_targets(
+            requested_scan_target, hf_token = hf_token
+        )
         try:
             from utils.models.model_config import get_base_model_from_lora_identifier
 

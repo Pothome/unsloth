@@ -116,6 +116,7 @@ import { useChatPickerInventory } from "../../inventory/use-chat-picker-inventor
 import {
   type CommunityModelPolicy,
   allowedHiddenModelIdMatches,
+  audioPipelineTagFor,
   audioPickIsRoutable,
   localAudioRowIsUndecodableGguf,
   communityAudioRowIsRunnable,
@@ -2111,8 +2112,6 @@ const MEDIA_PAGE_TASKS: readonly string[] = [
 ];
 
 /** The page that runs this task, or null when chat should handle the pick. */
-const TTS_CODECS = new Set(["snac", "csm", "bicodec", "dac"]);
-
 function mediaPageForTask(
   task: string | null | undefined,
 ): "images" | "video" | "audio" | null {
@@ -2337,6 +2336,7 @@ function localPathTooltip(
 function localModelMeta(
   isGguf = false,
   pipelineTag?: string | null,
+  audioType?: string | null,
 ): ModelSelectorChangeMeta {
   return {
     source: "local",
@@ -2344,6 +2344,7 @@ function localModelMeta(
     isDownloaded: true,
     ...(isGguf ? { isGguf: true } : {}),
     pipelineTag: pipelineTag ?? null,
+    audioType: audioType ?? null,
   };
 }
 
@@ -3553,6 +3554,7 @@ export function HubModelPicker({
                         (artifact) => artifact.format === "gguf",
                       ),
                   ),
+                  audioType: c.audio_type,
                 })) ||
               (catalog
                 ? artifactForRepoId(c.repo_id, catalog) !== null
@@ -3783,6 +3785,7 @@ export function HubModelPicker({
             task: pickedTask,
             isGguf: Boolean(meta.isGguf || meta.ggufFilename),
             isCurated: artifactForRepoId(id, AUDIO_CATALOG) !== null,
+            audioType: meta.audioType,
             isLocalCheckpoint:
               meta.source === "lora" ||
               meta.source === "exported" ||
@@ -3812,6 +3815,8 @@ export function HubModelPicker({
                       : (meta.ggufVariant ?? undefined),
                     // pickedTask, not meta.pipelineTag: a cached row carries no tag to forward.
                     task: pickedTask ?? undefined,
+                    audioType: meta.audioType ?? undefined,
+                    loadId: meta.loadId ?? undefined,
                   }
                 : diffusionRouteSearch(id, meta),
           });
@@ -5174,6 +5179,7 @@ export function HubModelPicker({
                 loadId: c.load_id,
                 isDownloaded: true,
                 pipelineTag: c.task ?? null,
+                audioType: c.audio_type ?? null,
               })
             }
             vramStatus={null}
@@ -5192,6 +5198,7 @@ export function HubModelPicker({
                   isDownloaded: true,
                   isGguf: false,
                   pipelineTag: c.task ?? null,
+                  audioType: c.audio_type ?? null,
                 })
               }
             />
@@ -5272,6 +5279,7 @@ export function HubModelPicker({
                 isDownloaded: true,
                 isGguf: model.isGguf === true,
                 pipelineTag,
+                audioType: model.audioType ?? null,
               })
             }
             vramStatus={null}
@@ -5943,7 +5951,7 @@ export function HubModelPicker({
                                     } else {
                                       onSelect(
                                         m.id,
-                                        localModelMeta(false, m.task),
+                                        localModelMeta(false, m.task, m.audio_type),
                                       );
                                     }
                                   }}
@@ -5984,7 +5992,7 @@ export function HubModelPicker({
                                     onConfigure={() =>
                                       onConfigure(
                                         m.id,
-                                        localModelMeta(false, m.task),
+                                        localModelMeta(false, m.task, m.audio_type),
                                       )
                                     }
                                   />
@@ -6088,7 +6096,7 @@ export function HubModelPicker({
                                     } else {
                                       onSelect(
                                         m.id,
-                                        localModelMeta(false, m.task),
+                                        localModelMeta(false, m.task, m.audio_type),
                                       );
                                     }
                                   }}
@@ -6129,7 +6137,7 @@ export function HubModelPicker({
                                     onConfigure={() =>
                                       onConfigure(
                                         m.id,
-                                        localModelMeta(false, m.task),
+                                        localModelMeta(false, m.task, m.audio_type),
                                       )
                                     }
                                   />
@@ -6220,7 +6228,7 @@ export function HubModelPicker({
                                     } else {
                                       onSelect(
                                         m.id,
-                                        localModelMeta(false, m.task),
+                                        localModelMeta(false, m.task, m.audio_type),
                                       );
                                     }
                                   }}
@@ -6257,7 +6265,7 @@ export function HubModelPicker({
                                     onConfigure={() =>
                                       onConfigure(
                                         m.id,
-                                        localModelMeta(false, m.task),
+                                        localModelMeta(false, m.task, m.audio_type),
                                       )
                                     }
                                   />
@@ -6269,7 +6277,7 @@ export function HubModelPicker({
                                 repoId={m.id}
                                 onDevice={true}
                                 onSelect={onSelect}
-                                resolveDownloadFootprint={resolveDownloadFootprint}
+                              resolveDownloadFootprint={resolveDownloadFootprint}
                                 onConfigure={onConfigure}
                                 parentOptionKey={optionKey}
                                 onNavigatePastStart={() =>
@@ -6484,7 +6492,7 @@ export function HubModelPicker({
                               repoId={id}
                               pipelineTag={pipelineTagById.get(id) ?? null}
                               onSelect={onSelect}
-                              resolveDownloadFootprint={resolveDownloadFootprint}
+                                resolveDownloadFootprint={resolveDownloadFootprint}
                               onConfigure={onConfigure}
                               hfToken={hfToken || undefined}
                               parentOptionKey={optionKey}
@@ -6667,22 +6675,6 @@ export function HubModelPicker({
 
 /** Fine-tuned model rows for the On Device tab's Fine-tuned section. Plugs into
  * that section's roving list and shared GGUF-expand state. */
-/** Codec -> the Hub pipeline tag the media routing understands, else undefined.
- *
- * A local checkpoint never gets the ASR tag: it would route to the Audio page, which hands
- * the filesystem path to /audio/stt/load, and the sidecar's resolve_model_id takes only a
- * curated key or an `owner/model` Hub id, so the row is advertised and then 422s. TTS is
- * fine, since that loads through the main slot, which does accept a local path. */
-function audioPipelineTagFor(
-  audioType?: string | null,
-  isLocalCheckpoint = false,
-): string | undefined {
-  if (!audioType) return undefined;
-  if (audioType === "whisper")
-    return isLocalCheckpoint ? undefined : "automatic-speech-recognition";
-  return TTS_CODECS.has(audioType) ? "text-to-speech" : undefined;
-}
-
 function FineTunedRows({
   adapters,
   value,
@@ -6723,6 +6715,7 @@ function FineTunedRows({
         const isExported = adapter.source === "exported";
         const isMerged = adapter.exportType === "merged";
         const isGguf = adapter.exportType === "gguf";
+        const isLora = !isLocal && !isMerged && !isGguf;
         const isExportedGguf = isExported && isGguf;
         const canDelete = canDeleteLoraModel(adapter);
         const isTrainingFull = isTraining && isMerged;
@@ -6737,10 +6730,11 @@ function FineTunedRows({
         // The pipeline tag is what onSelect routes on, so carry the detected codec as one.
         const selectionMeta: ModelSelectorChangeMeta = {
           source: isLocal ? "local" : isExported ? "exported" : "lora",
-          isLora: !isLocal && !isMerged && !isGguf,
+          isLora,
           isDownloaded: true,
           isGguf: isLocalDirectGguf,
-          pipelineTag: audioPipelineTagFor(adapter.audioType, true),
+          pipelineTag: audioPipelineTagFor(adapter.audioType, true, isLora),
+          audioType: adapter.audioType ?? null,
         };
         const canConfigure = !(isLocalGgufDir || isExportedGguf);
         const optionKey = makeModelOptionKey("lora", adapter.id);

@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  audioPipelineTagFor,
   audioPickIsRoutable,
   communityAudioRowIsRunnable,
   curatedAudioInventoryMatches,
@@ -580,21 +581,18 @@ test("an unroutable speech pick is refused instead of loaded into chat", () => {
   );
 });
 
-test("a local Whisper checkpoint is not advertised as a routable ASR row", () => {
+test("fine-tuned audio rows receive only runnable pipeline tags", () => {
   // The STT sidecar's resolve_model_id takes a curated key or an owner/model Hub id, so a
   // filesystem path 422s. Routing one from the picker advertised a row that cannot load.
-  const source = readFileSync(
-    new URL(
-      "../src/features/model-picker/components/model-selector/pickers.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  assert.equal(audioPipelineTagFor("whisper", true), undefined);
+  assert.equal(audioPipelineTagFor("moss_tts_local", true), "text-to-speech");
+  // Native runtimes reject adapter-only checkpoints; merged exports remain runnable.
+  assert.equal(audioPipelineTagFor("moss_tts_local", true, true), undefined);
+  assert.equal(audioPipelineTagFor("moss_tts_local", true, false), "text-to-speech");
   assert.match(
-    source,
-    /if \(audioType === "whisper"\)\s*\n?\s*return isLocalCheckpoint \? undefined : "automatic-speech-recognition";/,
+    pickerSource,
+    /pipelineTag: audioPipelineTagFor\(adapter\.audioType, true, isLora\)/,
   );
-  assert.match(source, /pipelineTag: audioPipelineTagFor\(adapter\.audioType, true\)/);
 });
 
 test("an arch-tasked speech GGUF routes by detected codec", () => {
